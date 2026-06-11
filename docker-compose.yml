@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  iban-api:
+    build: .
+    container_name: iban-api
+    restart: unless-stopped
+    networks:
+      - factory_network
+    environment:
+      - REDIS_HOST=core-redis
+    volumes:
+      - ./data:/data  # КРИТИЧНО: Збереження БД на хості (Zero-Data-Loss)
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  factory_network:
+    external: true
