@@ -4,6 +4,7 @@ import aiosqlite
 import redis.asyncio as redis
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from models import IBANRequest, IBANResponse
 from iban_logic import validate_iban
@@ -37,8 +38,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="IBAN Validator API", version="1.0.0", lifespan=lifespan)
 
-# Підключаємо Middleware
+# 1. Auth Middleware (Виконується ДРУГИМ, після того як CORS пропустить запит)
 app.add_middleware(AuthRateLimitMiddleware, redis_client=redis_client)
+
+# 2. CORS Middleware (Виконується ПЕРШИМ, безпечно відповідає на OPTIONS preflight)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://pactops.pro"], # Жорстко зафіксовано нашу Вітрину
+    allow_credentials=True,
+    allow_methods=["POST", "OPTIONS"],
+    allow_headers=["*"], # Пропускає X-API-Key
+)
 
 @app.get("/health")
 async def healthcheck():
