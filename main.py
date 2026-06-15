@@ -1,14 +1,17 @@
+```python
 import os
 import json
+import hmac
+import hashlib
 import aiosqlite
 import redis.asyncio as redis
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from models import IBANRequest, IBANResponse
 from iban_logic import validate_iban
-from middleware import AuthRateLimitMiddleware
+from middleware import AuthRateLimitMiddleware as _OriginalAuthMiddleware
 
 # Global Redis connection
 redis_client = redis.Redis(
@@ -38,16 +41,25 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="IBAN Validator API", version="1.0.0", lifespan=lifespan)
 
+# Архітектурний патч: Успадковуємо оригінальний Middleware прямо в main.py, 
+# щоб безпечно виключити Webhook з перевірки API-ключа без зміни файлу middleware.py
+class PatchedAuthRateLimitMiddleware(_OriginalAuthMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Пропускаємо healthcheck та Lemon Squeezy Webhook
+        if request.url.path in ["/health", "/v1/webhooks/lemonsqueezy"]:
+            return await call_next(request)
+        return await super().dispatch(request, call_next)
+
 # 1. Auth Middleware (Виконується ДРУГИМ, після того як CORS пропустить запит)
-app.add_middleware(AuthRateLimitMiddleware, redis_client=redis_client)
+app.add_middleware(PatchedAuthRateLimitMiddleware, redis_client=redis_client)
 
 # 2. CORS Middleware (Виконується ПЕРШИМ, безпечно відповідає на OPTIONS preflight)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://pactops.pro"], # Жорстко зафіксовано нашу Вітрину
     allow_credentials=True,
-    allow_methods=["POST", "OPTIONS"],
-    allow_headers=["*"], # Пропускає X-API-Key
+    allow_methods=["POST", "OPTIONS", "GET"], # GET потрібен для /health та Swagger UI
+    allow_headers=["*"], # Пропускає X-API-Key та X-Signature
 )
 
 @app.get("/health")
@@ -71,3 +83,69 @@ async def validate_iban_endpoint(payload: IBANRequest):
     await redis_client.setex(cache_key, 86400, json.dumps(result))
     
     return result
+
+@app.post("/v1/webhooks/lemonsqueezy")
+async def lemonsqueezy_webhook(request: Request):
+    """
+    Захищений ендпоінт для прийому вебхуків від Lemon Squeezy.
+    Автоматично генерує або блокує API-ключі в SQLite (Cold Storage).
+    """
+    secret = os.getenv("LEMON_SQUEEZY_WEBHOOK_SECRET")
+    if not secret:
+        raise HTTPException(status_code=500, detail="Webhook secret not configured")
+
+    # 1. Зчитуємо сире тіло запиту (Raw Body) для валідації підпису
+    body = await request.body()
+    
+    # 2. Отримуємо підпис з заголовка
+    signature = request.headers.get("X-Signature")
+    if not signature:
+        raise HTTPException(status_code=401, detail="Missing X-Signature header")
+
+    # 3. Генеруємо HMAC-SHA256 хеш сирого тіла
+    expected_signature = hmac.new(
+        secret.encode("utf-8"),
+        body,
+        hashlib.sha256
+    ).hexdigest()
+
+    # 4. Безпечне порівняння (захист від timing attacks)
+    if not hmac.compare_digest(signature, expected_signature):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    # 5. Парсинг JSON тіла
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    # 6. Обробка подій (Event Handling)
+    event_name = payload.get("meta", {}).get("event_name")
+    data_attributes = payload.get("data", {}).get("attributes", {})
+    key = data_attributes.get("key")
+
+    if not event_name:
+        return {"status": "ignored", "reason": "no event_name provided"}
+
+    # 7. Взаємодія з Cold Storage (SQLite)
+    async with aiosqlite.connect("/data/users.db") as db:
+        if event_name == "license_key.created":
+            if key:
+                # Активуємо новий ключ, куплений клієнтом
+                await db.execute(
+                    "INSERT OR REPLACE INTO api_keys (key, is_active) VALUES (?, 1)",
+                    (key,)
+                )
+                await db.commit()
+                
+        elif event_name in ["subscription_cancelled", "subscription_expired", "license_key.disabled"]:
+            if key:
+                # Негайно блокуємо доступ клієнту при відписці або експайрації
+                await db.execute(
+                    "UPDATE api_keys SET is_active = 0 WHERE key = ?",
+                    (key,)
+                )
+                await db.commit()
+
+    return {"status": "ok", "event": event_name}
+```
