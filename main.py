@@ -1,4 +1,3 @@
-```python
 import os
 import json
 import hmac
@@ -148,4 +147,3 @@ async def lemonsqueezy_webhook(request: Request):
                 await db.commit()
 
     return {"status": "ok", "event": event_name}
-```
