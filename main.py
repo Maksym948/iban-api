@@ -91,6 +91,7 @@ async def lemonsqueezy_webhook(request: Request):
     """
     secret = os.getenv("LEMON_SQUEEZY_WEBHOOK_SECRET")
     if not secret:
+        print("CRITICAL: Webhook secret not configured in environment variables!")
         raise HTTPException(status_code=500, detail="Webhook secret not configured")
 
     # 1. Зчитуємо сире тіло запиту (Raw Body) для валідації підпису
@@ -128,7 +129,7 @@ async def lemonsqueezy_webhook(request: Request):
 
     # 7. Взаємодія з Cold Storage (SQLite)
     async with aiosqlite.connect("/data/users.db") as db:
-        if event_name == "license_key.created":
+        if event_name == "license_key_created":
             if key:
                 # Активуємо новий ключ, куплений клієнтом
                 await db.execute(
@@ -137,7 +138,7 @@ async def lemonsqueezy_webhook(request: Request):
                 )
                 await db.commit()
                 
-        elif event_name in ["subscription_cancelled", "subscription_expired", "license_key.disabled"]:
+        elif event_name in ["subscription_cancelled", "subscription_expired", "license_key_disabled"]:
             if key:
                 # Негайно блокуємо доступ клієнту при відписці або експайрації
                 await db.execute(
